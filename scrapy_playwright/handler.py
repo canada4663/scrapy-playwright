@@ -83,6 +83,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         ) or settings.getint("CONCURRENT_REQUESTS")
         self.context_launch_lock = asyncio.Lock()
         self.context_wrappers: Dict[str, BrowserContextWrapper] = {}
+        self.existing_context: bool = settings.getbool("PLAYWRIGHT_EXISTING_CONTEXT")
         self.startup_context_kwargs: dict = settings.getdict("PLAYWRIGHT_CONTEXTS")
         if settings.getint("PLAYWRIGHT_MAX_CONTEXTS"):
             self.context_semaphore = asyncio.Semaphore(
@@ -136,6 +137,16 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             self._set_max_concurrent_context_count()
             logger.info("Startup context(s) launched")
             self.stats.set_value("playwright/page_count", self._get_total_page_count())
+        if self.existing_context and self.browser_cdp_url:
+            logger.info("Getting existing context(s)")
+            if not hasattr(self, "browser"):
+                await self._maybe_connect_devtools()
+            await asyncio.gather(
+                *[self._get_existing_browser_context(index=i) for i in range(len(self.browser.contexts))]
+            )
+            self._set_max_concurrent_context_count()
+            logger.info("Existing context(s) retrieved")
+            self.stats.set_value("playwright/page_count", self._get_total_page_count())
         del self.startup_context_kwargs
 
     async def _maybe_launch_browser(self) -> None:
@@ -180,6 +191,48 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             context = await self.browser.new_context(**context_kwargs)
             persistent = False
             remote = False
+
+        context.on(
+            "close", self._make_close_browser_context_callback(name, persistent, remote, spider)
+        )
+        self.stats.inc_value("playwright/context_count")
+        self.stats.inc_value(f"playwright/context_count/persistent/{persistent}")
+        self.stats.inc_value(f"playwright/context_count/remote/{remote}")
+        logger.debug(
+            "Browser context started: '%s' (persistent=%s, remote=%s)",
+            name,
+            persistent,
+            remote,
+            extra={
+                "spider": spider,
+                "context_name": name,
+                "persistent": persistent,
+                "remote": remote,
+            },
+        )
+        if self.default_navigation_timeout is not None:
+            context.set_default_navigation_timeout(self.default_navigation_timeout)
+        self.context_wrappers[name] = BrowserContextWrapper(
+            context=context,
+            semaphore=asyncio.Semaphore(value=self.max_pages_per_context),
+            persistent=persistent,
+        )
+        self._set_max_concurrent_context_count()
+        return self.context_wrappers[name]
+
+    async def _get_existing_browser_context(self, index: int = 0,
+                                            spider: Optional[Spider] = None,
+                                            ) -> BrowserContextWrapper | None:
+        if not self.browser_cdp_url or len(self.browser.contexts) <= index - 1:
+            return None
+        if not hasattr(self, "browser"):
+            await self._maybe_connect_devtools()
+        if hasattr(self, "context_semaphore"):
+            await self.context_semaphore.acquire()
+        name = f"existing_context_{index}"
+        context = self.browser.contexts[index]
+        persistent = False
+        remote = True
 
         context.on(
             "close", self._make_close_browser_context_callback(name, persistent, remote, spider)
